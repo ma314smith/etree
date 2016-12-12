@@ -5,8 +5,18 @@
 package etree
 
 import (
+	"io"
 	"testing"
 )
+
+func checkEq(t *testing.T, got, want string) {
+	if got == want {
+		return
+	}
+	t.Errorf(
+		"etree: unexpected result.\nGot:\n%s\nWanted:\n%s\n",
+		got, want)
+}
 
 func TestDocument(t *testing.T) {
 
@@ -46,9 +56,7 @@ func TestDocument(t *testing.T) {
 	</book>
 </store>
 `
-	if expected != s {
-		t.Error("etree: serialization incorrect")
-	}
+	checkEq(t, s, expected)
 
 	// Test the structure of the XML
 	if doc.Root() != store {
@@ -66,10 +74,10 @@ func TestDocument(t *testing.T) {
 	if len(author.ChildElements()) != 0 || len(author.Child) != 1 || len(author.Attr) != 0 {
 		t.Error("etree: incorrect tree structure")
 	}
-	if book.Parent != store || store.Parent != &doc.Element || doc.Parent != nil {
+	if book.parent != store || store.parent != &doc.Element || doc.parent != nil {
 		t.Error("etree: incorrect tree structure")
 	}
-	if title.Parent != book || author.Parent != book {
+	if title.parent != book || author.parent != book {
 		t.Error("etree: incorrect tree structure")
 	}
 
@@ -121,7 +129,7 @@ func TestDocument(t *testing.T) {
 	if element != nil {
 		t.Error("etree: incorrect SelectElement result")
 	}
-	element = book.RemoveElement(title)
+	element = book.RemoveChild(title).(*Element)
 	if element != title {
 		t.Error("etree: incorrect RemoveElement result")
 	}
@@ -129,6 +137,62 @@ func TestDocument(t *testing.T) {
 	if element != nil {
 		t.Error("etree: incorrect SelectElement result")
 	}
+}
+
+func TestDocumentRead_NonUTF8Encodings(t *testing.T) {
+	s := `<?xml version="1.0" encoding="ISO-8859-1"?>
+	<store>
+	<book lang="en">
+		<title>Great Expectations</title>
+		<author>Charles Dickens</author>
+	</book>
+</store>`
+
+	doc := NewDocument()
+	doc.ReadSettings.CharsetReader = func(label string, input io.Reader) (io.Reader, error) {
+		return input, nil
+	}
+	err := doc.ReadFromString(s)
+	if err != nil {
+		t.Fatal("etree: incorrect ReadFromString result")
+	}
+}
+
+func TestWriteSettings(t *testing.T) {
+	BOM := "\xef\xbb\xbf"
+
+	doc := NewDocument()
+	doc.WriteSettings.CanonicalEndTags = true
+	doc.WriteSettings.CanonicalText = true
+	doc.WriteSettings.CanonicalAttrVal = true
+	doc.CreateCharData(BOM)
+	doc.CreateProcInst("xml-stylesheet", `type="text/xsl" href="style.xsl"`)
+
+	people := doc.CreateElement("People")
+	people.CreateComment("These are all known people")
+
+	jon := people.CreateElement("Person")
+	jon.CreateAttr("name", "Jon O'Reilly")
+	jon.SetText("<'\">&")
+
+	sally := people.CreateElement("Person")
+	sally.CreateAttr("name", "Sally")
+	sally.CreateAttr("escape", "<'\">&")
+
+	doc.Indent(2)
+	s, err := doc.WriteToString()
+	if err != nil {
+		t.Error("etree: WriteSettings WriteTo produced incorrect result.")
+	}
+
+	expected := BOM + `<?xml-stylesheet type="text/xsl" href="style.xsl"?>
+<People>
+  <!--These are all known people-->
+  <Person name="Jon O'Reilly">&lt;'"&gt;&amp;</Person>
+  <Person name="Sally" escape="&lt;'&quot;>&amp;"></Person>
+</People>
+`
+	checkEq(t, s, expected)
 }
 
 func TestCopy(t *testing.T) {
@@ -139,18 +203,18 @@ func TestCopy(t *testing.T) {
 	</book>
 </store>`
 
-	doc1 := NewDocument()
-	err := doc1.ReadFromString(s)
+	doc := NewDocument()
+	err := doc.ReadFromString(s)
 	if err != nil {
-		t.Error("etree: incorrect ReadFromString result")
+		t.Fatal("etree: incorrect ReadFromString result")
 	}
 
-	s1, err := doc1.WriteToString()
+	s1, err := doc.WriteToString()
 	if err != nil {
 		t.Error("etree: incorrect WriteToString result")
 	}
 
-	doc2 := doc1.Copy()
+	doc2 := doc.Copy()
 	s2, err := doc2.WriteToString()
 	if err != nil {
 		t.Error("etree: incorrect Copy result")
@@ -158,9 +222,11 @@ func TestCopy(t *testing.T) {
 
 	if s1 != s2 {
 		t.Error("etree: mismatched Copy result")
+		t.Error("wanted:\n" + s1)
+		t.Error("got:\n" + s2)
 	}
 
-	e1 := doc1.FindElement("./store/book/title")
+	e1 := doc.FindElement("./store/book/title")
 	e2 := doc2.FindElement("./store/book/title")
 	if e1 == nil || e2 == nil {
 		t.Error("etree: incorrect FindElement result")
@@ -169,10 +235,175 @@ func TestCopy(t *testing.T) {
 		t.Error("etree: incorrect FindElement result")
 	}
 
-	e1.Parent.RemoveElement(e1)
-	s1, _ = doc1.WriteToString()
+	e1.parent.RemoveChild(e1)
+	s1, _ = doc.WriteToString()
 	s2, _ = doc2.WriteToString()
 	if s1 == s2 {
 		t.Error("etree: incorrect result after RemoveElement")
 	}
+}
+
+func TestInsertChild(t *testing.T) {
+	testdoc := `<book lang="en">
+  <t:title>Great Expectations</t:title>
+  <author>Charles Dickens</author>
+</book>
+`
+
+	doc := NewDocument()
+	err := doc.ReadFromString(testdoc)
+	if err != nil {
+		t.Fatal("etree ReadFromString: " + err.Error())
+	}
+
+	year := NewElement("year")
+	year.SetText("1861")
+
+	book := doc.FindElement("//book")
+	book.InsertChild(book.SelectElement("t:title"), year)
+
+	expected1 := `<book lang="en">
+  <year>1861</year>
+  <t:title>Great Expectations</t:title>
+  <author>Charles Dickens</author>
+</book>
+`
+	doc.Indent(2)
+	s1, _ := doc.WriteToString()
+	checkEq(t, s1, expected1)
+
+	book.RemoveChild(year)
+	book.InsertChild(book.SelectElement("author"), year)
+
+	expected2 := `<book lang="en">
+  <t:title>Great Expectations</t:title>
+  <year>1861</year>
+  <author>Charles Dickens</author>
+</book>
+`
+	doc.Indent(2)
+	s2, _ := doc.WriteToString()
+	checkEq(t, s2, expected2)
+
+	book.RemoveChild(year)
+	book.InsertChild(book.SelectElement("UNKNOWN"), year)
+
+	expected3 := `<book lang="en">
+  <t:title>Great Expectations</t:title>
+  <author>Charles Dickens</author>
+  <year>1861</year>
+</book>
+`
+	doc.Indent(2)
+	s3, _ := doc.WriteToString()
+	checkEq(t, s3, expected3)
+
+	book.RemoveChild(year)
+	book.InsertChild(nil, year)
+
+	expected4 := `<book lang="en">
+  <t:title>Great Expectations</t:title>
+  <author>Charles Dickens</author>
+  <year>1861</year>
+</book>
+`
+	doc.Indent(2)
+	s4, _ := doc.WriteToString()
+	checkEq(t, s4, expected4)
+}
+
+func TestAddChild(t *testing.T) {
+	testdoc := `<book lang="en">
+  <t:title>Great Expectations</t:title>
+  <author>Charles Dickens</author>
+`
+	doc1 := NewDocument()
+	err := doc1.ReadFromString(testdoc)
+	if err != nil {
+		t.Fatal("etree ReadFromString: " + err.Error())
+	}
+
+	doc2 := NewDocument()
+	root := doc2.CreateElement("root")
+
+	for _, e := range doc1.FindElements("//book/*") {
+		root.AddChild(e)
+	}
+
+	expected1 := `<book lang="en"/>
+`
+	doc1.Indent(2)
+	s1, _ := doc1.WriteToString()
+	checkEq(t, s1, expected1)
+
+	expected2 := `<root>
+  <t:title>Great Expectations</t:title>
+  <author>Charles Dickens</author>
+</root>
+`
+	doc2.Indent(2)
+	s2, _ := doc2.WriteToString()
+	checkEq(t, s2, expected2)
+}
+
+func TestSetRoot(t *testing.T) {
+	testdoc := `<?test a="wow"?>
+<book>
+  <title>Great Expectations</title>
+  <author>Charles Dickens</author>
+</book>
+`
+	doc := NewDocument()
+	err := doc.ReadFromString(testdoc)
+	if err != nil {
+		t.Fatal("etree ReadFromString: " + err.Error())
+	}
+
+	origroot := doc.Root()
+	if origroot.Parent() != &doc.Element {
+		t.Error("Root incorrect")
+	}
+
+	newroot := NewElement("root")
+	doc.SetRoot(newroot)
+
+	if doc.Root() != newroot {
+		t.Error("doc.Root() != newroot")
+	}
+	if origroot.Parent() != nil {
+		t.Error("origroot.Parent() != nil")
+	}
+
+	expected1 := `<?test a="wow"?>
+<root/>
+`
+	doc.Indent(2)
+	s1, _ := doc.WriteToString()
+	checkEq(t, s1, expected1)
+
+	doc.SetRoot(origroot)
+	doc.Indent(2)
+	expected2 := testdoc
+	s2, _ := doc.WriteToString()
+	checkEq(t, s2, expected2)
+
+	doc2 := NewDocument()
+	doc2.CreateProcInst("test", `a="wow"`)
+	doc2.SetRoot(NewElement("root"))
+	doc2.Indent(2)
+	expected3 := expected1
+	s3, _ := doc2.WriteToString()
+	checkEq(t, s3, expected3)
+
+	doc2.SetRoot(doc.Root())
+	doc2.Indent(2)
+	expected4 := testdoc
+	s4, _ := doc2.WriteToString()
+	checkEq(t, s4, expected4)
+
+	expected5 := `<?test a="wow"?>
+`
+	doc.Indent(2)
+	s5, _ := doc.WriteToString()
+	checkEq(t, s5, expected5)
 }
